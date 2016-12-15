@@ -1,6 +1,24 @@
 pragma solidity ^0.4.2;
-import "AbstractHumaniqToken.sol";
 
+/// Implements ERC 20 Token standard: https://github.com/ethereum/EIPs/issues/20
+/// @title Abstract token contract - Functions to be implemented by token contracts.
+contract Token {
+    // This is not an abstract function, because solc won't recognize generated getter functions for public variables as functions
+    function totalSupply() constant returns (uint256 supply) {}
+    function balanceOf(address owner) constant returns (uint256 balance);
+    function transfer(address to, uint256 value) returns (bool success);
+    function transferFrom(address from, address to, uint256 value) returns (bool success);
+    function approve(address spender, uint256 value) returns (bool success);
+    function allowance(address owner, address spender) constant returns (uint256 remaining);
+
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+}
+
+contract HumaniqToken is Token {
+    function issueTokens(address _for, uint tokenCount) payable returns (bool);
+    function changeEmissionContractAddress(address newAddress) returns (bool);
+}
 
 /// @title HumaniqICO contract - Takes funds from users and issues tokens.
 /// @author Evgeny Yurtaev - <evgeny@etherionlab.com>
@@ -14,16 +32,17 @@ contract HumaniqICO {
     /*
      * Crowdfunding parameters
      */
-    uint constant public CROWDFUNDING_PERIOD = 14 days; // 1 month
-    uint constant public CROWDSALE_TARGET = 10000; // Goal threshold, 10000 ETH
+    uint constant public CROWDFUNDING_PERIOD = 12 days;
+    // Goal threshold, 10000 ETH
+    uint constant public CROWDSALE_TARGET = 10000 ether;
 
     /*
      *  Storage
      */
     address public founder;
     address public multisig;
-    uint public startDate;
-    uint public icoBalance;
+    uint public startDate = 0;
+    uint public icoBalance = 0;
     uint public baseTokenPrice = 666 szabo; // 0.000666 ETH
     uint public discountedPrice = baseTokenPrice;
     bool public isICOActive = false;
@@ -34,13 +53,6 @@ contract HumaniqICO {
     /*
      *  Modifiers
      */
-    modifier noEther() {
-        if (msg.value > 0) {
-            throw;
-        }
-        _;
-    }
-
     modifier onlyFounder() {
         // Only founder is allowed to do this action.
         if (msg.sender != founder) {
@@ -64,18 +76,18 @@ contract HumaniqICO {
         _;
     }
 
-    modifier timedTransitions() {
+    modifier applyBonus() {
         uint icoDuration = now - startDate;
-        if (icoDuration >= 10 days) {
+        if (icoDuration >= 248 hours) {
             discountedPrice = baseTokenPrice;
         }
-        else if (icoDuration >= 7 days) {
+        else if (icoDuration >= 176 hours) {
             discountedPrice = (baseTokenPrice * 100) / 107;
         }
-        else if (icoDuration >= 4 days) {
+        else if (icoDuration >= 104 hours) {
             discountedPrice = (baseTokenPrice * 100) / 120;
         }
-        else if (icoDuration >= 1 days) {
+        else if (icoDuration >= 32 hours) {
             discountedPrice = (baseTokenPrice * 100) / 142;
         }
         else if (icoDuration >= 12 hours) {
@@ -87,33 +99,11 @@ contract HumaniqICO {
         _;
     }
 
-    /*
-     *  Contract functions
-     */
-    /// @dev Checks if crowdfunding has finished and the amount of money
-    /// collected is higher than crowdfunding goal.
-    function hasFinishedSuccessfully() constant internal returns (bool) {
-        if ((isICOActive == false) && (icoBalance > CROWDSALE_TARGET)) {
-            return true;
-        }
-        return false;
-    }
-
-    /// @dev Changes status of ICO to inactive if crowdfunding period has finished.
-    function updateICOStatus() internal {
-      if (isICOActive == true) {
-        uint icoDuration = now - startDate;
-        if (icoDuration >= CROWDFUNDING_PERIOD) {
-            isICOActive = false;
-        }
-      }
-    }
-
     /// @dev Allows user to create tokens if token creation is still going
     /// and cap was not reached. Returns token count.
     function fund()
-        external
-        timedTransitions
+        public
+        applyBonus
         icoActive
         minInvestment
         payable
@@ -130,7 +120,12 @@ contract HumaniqICO {
         // Update fund's and user's balance and total supply of tokens.
         icoBalance += investment;
         investments[msg.sender] += investment;
-        if (!humaniqToken.issueTokens.value(0)(msg.sender, tokenCount)) {
+        // Send funds to founders.
+        if (!multisig.send(investment)) {
+            // Could not send money
+            throw;
+        }
+        if (!humaniqToken.issueTokens(msg.sender, tokenCount)) {
             // Tokens could not be issued.
             throw;
         }
@@ -142,7 +137,7 @@ contract HumaniqICO {
     /// @param _tokenCount Number of tokens to issue.
     function fundBTC(address beneficiary, uint _tokenCount)
         external
-        timedTransitions
+        applyBonus
         icoActive
         onlyFounder
         returns (uint)
@@ -150,60 +145,37 @@ contract HumaniqICO {
         // Approximate ether spent.
         uint investment = _tokenCount * discountedPrice;
         // Update fund's and user's balance and total supply of tokens.
-        // Do not update individual investment, because user paid in BTC.
         icoBalance += investment;
-        if (!humaniqToken.issueTokens.value(0)(beneficiary, _tokenCount)) {
+        investments[beneficiary] += investment;
+        if (!humaniqToken.issueTokens(beneficiary, _tokenCount)) {
             // Tokens could not be issued.
             throw;
         }
         return _tokenCount;
     }
 
-    /// @dev Allows user to withdraw ETH if token creation period ended and
-    /// crowdfunding target was not reached. Returns success.
-    function withdrawFunding()
-        external
-        noEther
-        returns (bool)
-    {
-        // Update current ICO status.
-        updateICOStatus();
-        // If ICO is still going or ICO has successfully finised, throw.
-        if ((isICOActive == true) || (hasFinishedSuccessfully() == true)) {
-          throw;
-        }
-        // Continue only if ICO failed to meet the threshold.
-        uint investment = investments[msg.sender];
-        investments[msg.sender] = 0;
-        icoBalance -= investment;
-        // Send ETH back to user.
-        if (investment > 0  && !msg.sender.send(investment)) {
-            throw;
-        }
-        return true;
-    }
-
     /// @dev If ICO has successfully finished sends the money to multisig
     /// wallet.
     function finishCrowdsale()
         external
-        noEther
         onlyFounder
         returns (bool)
     {
-      if (hasFinishedSuccessfully()) {
-        if (!multisig.send(this.balance)) {
-          // Could not send money
-          throw;
+        if (isICOActive == true) {
+            isICOActive = false;
+            // Founders receive 14% of all created tokens.
+            uint founderBonus = ((icoBalance / baseTokenPrice) * 114) / 100;
+            if (!humaniqToken.issueTokens(multisig, founderBonus)) {
+                // Tokens could not be issued.
+                throw;
+            }
         }
-      }
     }
 
     /// @dev Sets token value in Wei.
     /// @param valueInWei New value.
     function changeBaseTokenPrice(uint valueInWei)
         external
-        noEther
         onlyFounder
         returns (bool)
     {
@@ -215,9 +187,8 @@ contract HumaniqICO {
     function startICO()
         external
         onlyFounder
-        noEther
     {
-        if (isICOActive == false) {
+        if (isICOActive == false && startDate == 0) {
           // Start ICO
           isICOActive = true;
           // Set start-date of token creation
@@ -226,15 +197,15 @@ contract HumaniqICO {
     }
 
     /// @dev Contract constructor function sets founder and multisig addresses.
-    function HumaniqICO(address _multisig) noEther {
+    function HumaniqICO(address _multisig) {
         // Set founder address
         founder = msg.sender;
         // Set multisig address
         multisig = _multisig;
     }
 
-    /// @dev Fallback function always fails. Use fund function to create tokens.
-    function () {
-        throw;
+    /// @dev Fallback function. Calls fund() function to create tokens.
+    function () payable {
+        fund();
     }
 }
